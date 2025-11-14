@@ -68,7 +68,15 @@ class ESDataset(Dataset):
     def __getitem__(self, idx):
         key = self.keys[idx]
         if not self.args.test:
-            g,Y= pickle.loads(self.txn.get(key.encode(), db=self.graph_db))
+            value = self.txn.get(key.encode(), db=self.graph_db)
+            if value is None:
+                # Fallback: build on the fly if key not found in LMDB
+                try:
+                    g, Y = self._GetGraph(key, self.args)
+                except Exception:
+                    return None
+            else:
+                g, Y = pickle.loads(value)
         else:
             try:
                 g,Y = self._GetGraph(key,self.args)
@@ -112,7 +120,7 @@ class ESDataset(Dataset):
                     m1,m2= pickle.load(f)
             except:
                 with open(key, 'rb') as f:
-                    m1,m2,atompairs,iter_types= pickle.load(f)
+                    m1,m2,atompairs,inter_types= pickle.load(f)
         except:
             return None
         n1,d1,adj1 = get_mol_info(m1)
@@ -133,12 +141,12 @@ class ESDataset(Dataset):
             # slowly when trainging from raw data ,so we save the result in disk,for next time use
             if 'inter_types' not in vars().keys() and 'atompairs' not in vars().keys():
                 try:
-                    atompairs,iter_types = get_nonBond_pair(m1,m2)
+                    atompairs,inter_types = get_nonBond_pair(m1,m2)
                 except:
-                    atompairs,iter_types = [],[]
+                    atompairs,inter_types = [],[]
                     # print(key)
                 with open(key,'wb') as f:
-                    pickle.dump((m1,m2,atompairs,iter_types),f)
+                    pickle.dump((m1,m2,atompairs,inter_types),f)
                 f.close()
             if len(atompairs) > 0:
                 temp_fp= np.array(atompairs)
@@ -186,32 +194,107 @@ if __name__ == "__main__":
     args = parse_train_args()
 
     # create lmdb database for map data and key,this step can help speed up training! Also ,can can skip this step too.
-    
+
     env = lmdb.open(args.lmdb_cache, map_size=int(1e12), max_dbs=1)
     # create lmdb database
     dgl_graph_db = env.open_db('data'.encode())
-    # read all data file path from pkl file  
-    """ 
+    # read all data file path from pkl file
+    """
     Attention:
         you should change contain all data path in test_keys when you process data to LMDB database,
         also you can just specity a file path directly rather than passing it via args vatriable!
-        
     """
-    with open (args.test_keys, 'rb') as fp:
-        val_keys = pickle.load(fp)
-    keys =  val_keys 
-    ################ save processed data into database and then you can index data by the key in training_keys.pkl file ##########################
-    def saveDB(key):
+    # try to aggregate keys from train/val/test if available
+    keys = []
+    train_keys = []
+    val_keys = []
+    test_keys = []
+    try:
+        if os.path.isfile(args.train_keys):
+            with open(args.train_keys, 'rb') as fp:
+                train_keys = pickle.load(fp)
+    except Exception:
+        pass
+    try:
+        if os.path.isfile(args.val_keys):
+            with open(args.val_keys, 'rb') as fp:
+                val_keys = pickle.load(fp)
+    except Exception:
+        pass
+    try:
+        if os.path.isfile(args.test_keys):
+            with open(args.test_keys, 'rb') as fp:
+                test_keys = pickle.load(fp)
+    except Exception:
+        pass
+
+    merged = []
+    for lst in (train_keys, val_keys, test_keys):
+        if lst:
+            merged.extend(lst)
+    if merged:
+        # preserve order and uniqueness
+        seen = set()
+        keys = [k for k in merged if not (k in seen or seen.add(k))]
+    else:
+        # fallback to original behavior: use test_keys only
+        with open(args.test_keys, 'rb') as fp:
+            keys = pickle.load(fp)
+
+    # ===== Optimization: compute-write decoupling + batched writes =====
+    # - Worker processes only build and serialize (g, y), no LMDB access.
+    # - Main process acts as the single LMDB writer and commits in batches.
+
+    def _build_one(key):
+        try:
+            g, y = ESDataset._GetGraph(key, args)
+            data = pickle.dumps((g, y), protocol=pickle.HIGHEST_PROTOCOL)
+            return key.encode(), data
+        except Exception:
+            print('file: {} is not a valid file!'.format(key))
+            return None
+
+    BATCH_SIZE = 512
+    procs = min(cpu_count(), 32)
+
+    buffer = []
+    written = 0
+    total = len(keys)
+
+    print(f'Start LMDB build: items={total}, procs={procs}, batch={BATCH_SIZE}')
+
+    def _flush(buf):
+        if not buf:
+            return 0
         with env.begin(write=True) as txn:
-            try:
-                g,y = ESDataset._GetGraph(key,args)
-                txn.put(key.encode(), pickle.dumps((g,y)), db = dgl_graph_db)
-            except:
-                print('file: {} is not a valid file!'.format(key))
-    all_keys = len(keys)
-    with Pool(processes = 32) as pool:
-        list(pool.imap(saveDB, keys))
-    print('save done!')
+            for kv in buf:
+                if kv is None:
+                    continue
+                k, v = kv
+                txn.put(k, v, db=dgl_graph_db)
+        return len(buf)
+
+    with Pool(processes=procs) as pool:
+        for kv in pool.imap_unordered(_build_one, keys, chunksize=64):
+            if kv is None:
+                continue
+            buffer.append(kv)
+            if len(buffer) >= BATCH_SIZE:
+                add = _flush(buffer)
+                written += add
+                buffer = []
+                # progress print
+                pct = (written / total) * 100 if total else 100.0
+                print(f'Progress: {written}/{total} ({pct:.2f}%)', flush=True)
+        # flush remaining
+        add = _flush(buffer)
+        written += add
+        buffer = []
+        pct = (written / total) * 100 if total else 100.0
+        print(f'Progress: {written}/{total} ({pct:.2f}%)', flush=True)
+
+    print('save done! total items written:', written)
+    env.sync()
     env.close()
 
 

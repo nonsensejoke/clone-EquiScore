@@ -170,40 +170,48 @@ def evaluator(model,loader,loss_fn,args,test_sampler):
     model.eval()
     with torch.no_grad():
         test_losses,test_true,test_pred = [], [],[]
+        # Only use distributed GPU gather when actual multi-GPU is initialized
+        use_ddp = (args.ngpu is not None and args.ngpu > 1 and 
+                   torch.distributed.is_available() and torch.distributed.is_initialized() and 
+                   torch.distributed.get_world_size() > 1)
         for i_batch, (g,full_g,Y) in enumerate(loader):
- 
+
             model.zero_grad()
             g = g.to(args.local_rank,non_blocking=True)
             full_g = full_g.to(args.local_rank,non_blocking=True)
             Y = Y.long().to(args.local_rank,non_blocking=True)
             pred = model(g,full_g)
             loss = loss_fn(pred ,Y) 
- 
+
             if args.ngpu >= 1:
                 dist.all_reduce(loss.data,op = torch.distributed.ReduceOp.SUM)
                 loss /= float(dist.get_world_size()) # get all loss value 
             # collect loss, true label and predicted label
-            test_losses.append(loss.data)
-            if args.ngpu >= 1:
-                test_true.append(Y.data)
-            else:
-                test_true.append(Y.data)
+            # store loss as CPU scalar
+            test_losses.append(loss.detach().cpu().item())
 
             if pred.dim()==2:
                 pred = torch.softmax(pred,dim = -1)[:,1]
             pred = pred if args.loss_fn == 'auc_loss' else pred
-            test_pred.append(pred.data) if args.ngpu >= 1 else test_pred.append(pred.data)
+
+            if use_ddp:
+                # keep tensors on GPU for NCCL all_gather compatibility
+                test_true.append(Y.detach())
+                test_pred.append(pred.detach())
+            else:
+                # single-GPU or non-DDP: move to CPU immediately to free GPU memory
+                test_true.append(Y.detach().cpu())
+                test_pred.append(pred.detach().cpu())
 
         # gather ngpu result to single tensor
-        if args.ngpu >= 1:
-            test_true = distributed_concat(torch.concat(test_true, dim=0), 
+        if use_ddp:
+            test_true = distributed_concat(torch.cat(test_true, dim=0), 
                                             len(test_sampler.dataset)).cpu().numpy()
-            test_pred = distributed_concat(torch.concat(test_pred, dim=0), 
+            test_pred = distributed_concat(torch.cat(test_pred, dim=0), 
                                             len(test_sampler.dataset)).cpu().numpy()
-        
         else:
-            test_true = torch.concat(test_true, dim=0).cpu().numpy()
-            test_pred = torch.concat(test_pred, dim=0).cpu().numpy()
+            test_true = torch.cat(test_true, dim=0).cpu().numpy()
+            test_pred = torch.cat(test_pred, dim=0).cpu().numpy()
     return test_losses,test_true,test_pred
 import copy
 import tqdm
@@ -225,7 +233,8 @@ def train(model,args,optimizer,loss_fn,train_dataloader,scheduler):
 
         logits = model(g,full_g)
         loss = loss_fn(logits, Y)
-        train_losses.append(loss)
+        # store CPU scalar to avoid holding GPU graph tensors across iterations
+        train_losses.append(loss.detach().cpu().item())
 
         loss = loss/args.grad_sum
         loss.backward()

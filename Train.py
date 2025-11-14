@@ -146,8 +146,9 @@ def run(local_rank,args):
             dist.barrier() 
         if local_rank == 0:
             test_losses = 0.0
-            train_losses = torch.mean(torch.tensor(train_losses,dtype=torch.float)).data.cpu().numpy()
-            val_losses = torch.mean(torch.tensor(val_losses,dtype=torch.float)).data.cpu().numpy()
+            # train_losses and val_losses are lists of CPU floats; use numpy mean directly
+            train_losses = float(np.mean(train_losses))
+            val_losses = float(np.mean(val_losses))
             if args.loss_fn == 'mse_loss':
                 end = time.time()
                 with open(log_path,'a') as f:
@@ -191,12 +192,12 @@ if '__main__' == __name__:
     # get args from parsering function
     args = parse_train_args()
     # set gpu to use
-    if args.ngpu>0:
-        cmd = get_available_gpu(num_gpu=args.ngpu, min_memory=8000, sample=3, nitro_restriction=False, verbose=True)
-        if cmd[-1] == ',':
-            os.environ['CUDA_VISIBLE_DEVICES']=cmd[:-1]
-        else:
-            os.environ['CUDA_VISIBLE_DEVICES']=cmd
+    # if args.ngpu>0:
+    #     cmd = get_available_gpu(num_gpu=args.ngpu, min_memory=8000, sample=3, nitro_restriction=False, verbose=True)
+    #     if cmd[-1] == ',':
+    #         os.environ['CUDA_VISIBLE_DEVICES']=cmd[:-1]
+    #     else:
+    #         os.environ['CUDA_VISIBLE_DEVICES']=cmd
     os.environ["MASTER_ADDR"] = args.MASTER_ADDR
     os.environ["MASTER_PORT"] = args.MASTER_PORT
     from torch.multiprocessing import Process
