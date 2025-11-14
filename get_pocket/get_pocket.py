@@ -1,3 +1,8 @@
+# note: 这个口袋会保留 其他HETATM残基
+# python get_pocket/get_pocket.py --docking_result data/sample_data/sample_compounds.sdf --receptor_pdb data/sample_data/sample_protein.pdb --single_sdf_save_path ./data/sample_data/tmp_sdfs --pocket_save_dir ./data/sample_data/tmp_pockets --pocket_pdb_save_dir ./data/sample_data/tmp_pockets_pdb 
+#
+# --pocket_save_dir 保存的是 (lig,pocket)的pickle文件,两者都是rdkit object
+# 
 import pickle
 import os
 import glob
@@ -8,9 +13,10 @@ from scipy.spatial import distance_matrix
 from Bio.PDB import *
 from Bio.PDB.PDBIO import Select
 import warnings
+import shutil
 warnings.filterwarnings('ignore')
 
-def extract(ligand, pdb,key):
+def extract(ligand, pdb, key, pocket_pdb_save_dir=None):
     """
     input: 
         ligand: 3D ligand structure, eg:rdkit.MOl 
@@ -41,15 +47,25 @@ def extract(ligand, pdb,key):
     io.set_structure(structure)
     fn = "BS_tmp_"+str(key)+".pdb"
     io.save(fn, ResidueSelect())
+
+    # destination for saving the pocket PDB (if requested)
+    out_pdb_path = None
+    if pocket_pdb_save_dir is not None:
+        try:
+            os.makedirs(pocket_pdb_save_dir, exist_ok=True)
+        except Exception:
+            pass
+        out_pdb_path = os.path.join(pocket_pdb_save_dir, f"{key}-pocket.pdb")
     try:
         m2 = Chem.MolFromPDBFile(fn)
+        src_for_save = fn
         # may contain metal atom, causing MolFromPDBFile return None
         if m2 is None:
             print("first read PDB fail",fn)
             # copy file to tmp dir 
             remove_zn_dir="./docker_result_remove_ZN"
-            if not os.path.exists(remove_zn_dir):
-                os.mkdir(remove_zn_dir)
+            # ensure the directory exists even if it's nested
+            os.makedirs(remove_zn_dir, exist_ok=True)
             cmd=f"cp {fn}   {remove_zn_dir}"
             print(cmd)
             os.system(cmd)
@@ -58,28 +74,40 @@ def extract(ligand, pdb,key):
             os.system(cmd)
             print("delete metal atom and get new pdb file",fn_remove_zn)
             m2 = Chem.MolFromPDBFile(fn_remove_zn)
-        else:
-            os.system("rm -f " + fn)
-    except:
+            if os.path.exists(fn_remove_zn):
+                src_for_save = fn_remove_zn
+        # Save pocket PDB to output directory if requested
+        if out_pdb_path is not None:
+            try:
+                shutil.copyfile(src_for_save, out_pdb_path)
+            except Exception as e:
+                print("save pocket pdb failed", out_pdb_path, e)
+        # cleanup temporary pdb if present
+        try:
+            if os.path.exists(fn):
+                os.remove(fn)
+        except Exception:
+            pass
+    except Exception:
         print("Read PDB fail for other unknow reason",fn)
     
     return m2
 
-def preprocessor(docking_result_sdf_fn,origin_recptor_pdb,data_dir):
+def preprocessor(docking_result_sdf_fn, origin_receptor_pdb, data_dir, pocket_pdb_save_dir=None):
     """
     get pocket from docking result and save to a pkl file: (m1,m2)
 
     input:
         docking_result_sdf_fn: docking result sdf file, one ligand in sdf file will speed up this process in multi-process
-        origin_recptor_pdb: receptor pdb file
+        origin_receptor_pdb: receptor pdb file
         data_dir: path for save pocket file
     output:
         0: success
         -1: fail
     """
     sdf_fn = docking_result_sdf_fn.split("/")[-1].split(".")[0] 
-    if not os.path.exists(data_dir):
-        os.mkdir(data_dir)
+    # ensure pocket save directory exists (support nested paths)
+    os.makedirs(data_dir, exist_ok=True)
     if os.path.getsize(docking_result_sdf_fn): #docking ligand file may be 0 size
         total=Chem.SDMolSupplier(docking_result_sdf_fn)
         for i,m1 in enumerate(total):
@@ -90,7 +118,7 @@ def preprocessor(docking_result_sdf_fn,origin_recptor_pdb,data_dir):
                     print(f"{key} mol no conformer!")
                     continue
                 try:
-                    m2 = extract(m1, origin_recptor_pdb,key)
+                    m2 = extract(m1, origin_receptor_pdb, key, pocket_pdb_save_dir)
                 except:
                     print(f'extract m2 failed {sdf_fn}')
                     continue
@@ -165,8 +193,8 @@ def saveMolToSDF(i,sample,args):
     else:
         print(f'file done before so skip it {i}')
         return 0
-def get_pocket_with_water(complex_sample,receptor_fn,out_data_dir):
-    status=preprocessor(complex_sample,receptor_fn,out_data_dir)
+def get_pocket_with_water(complex_sample, receptor_fn, out_data_dir, pocket_pdb_save_dir=None):
+    status = preprocessor(complex_sample, receptor_fn, out_data_dir, pocket_pdb_save_dir)
     # print(status)
 if __name__ == '__main__':
 
@@ -182,9 +210,10 @@ if __name__ == '__main__':
     parser.add_argument("--single_sdf_save_path", help="file path for save compounds from docking result.", type=str, \
         default=None,required=True)
     parser.add_argument("--docking_result", help="docking result filname.maegz,filename.mae or filename.sdf.", type=str,default=None,required=True)
-    parser.add_argument("--recptor_pdb", help="receptor pdb file.", type=str,default=None,required=True)
+    parser.add_argument("--receptor_pdb", help="receptor pdb file.", type=str,default=None,required=True)
     parser.add_argument("--pocket_save_dir", help="save pocket file dir.", type=str,default=None,required=True)
-    parser.add_argument("--prefix", help="Anything that helps you distinguish between compounds.", type=str,default='Compound')
+    parser.add_argument("--prefix", help="Anything that helps you distinguish between compounds or poses.", type=str,default='Compound')
+    parser.add_argument("--pocket_pdb_save_dir", help="save pocket PDB files dir.", type=str, default=None)
     parser.add_argument("--process_num", help="process num for multi process ", type=int,default=1)
     parser.add_argument("--save_single_sdf",action='store_false', help="save docking result to dir ",default=True)
     parser.add_argument("--extract_pocket",action='store_false', help="save docking result to dir ",default=True)
@@ -206,10 +235,14 @@ if __name__ == '__main__':
 
     """get pocket by multi process""" 
     if args.extract_pocket:
+        # ensure output directories exist ahead of multiprocessing
+        os.makedirs(args.pocket_save_dir, exist_ok=True)
+        if args.pocket_pdb_save_dir is not None:
+            os.makedirs(args.pocket_pdb_save_dir, exist_ok=True)
         total_sdfs = [os.path.join(args.single_sdf_save_path,filename) for filename in os.listdir(args.single_sdf_save_path)]
         file_tuple_list = []
         for complex_sample in total_sdfs:
-            receptor_fn=args.recptor_pdb
+            receptor_fn=args.receptor_pdb
             file_tuple_list.append((complex_sample,receptor_fn))
         print('num compounds to get pocket',len(file_tuple_list))
         out_data_dir = args.pocket_save_dir
@@ -218,7 +251,7 @@ if __name__ == '__main__':
         pbar.set_description('get_pocket:')
         update = lambda *args: pbar.update() # set callback function to update pbar state when process end
         for file_tuple in file_tuple_list:
-            p.apply_async(get_pocket_with_water,args = (file_tuple[0],file_tuple[1],args.pocket_save_dir),callback=update)
+            p.apply_async(get_pocket_with_water, args=(file_tuple[0], file_tuple[1], args.pocket_save_dir, args.pocket_pdb_save_dir), callback=update)
         print('waiting for processing!')
         p.close()
         p.join()

@@ -1,3 +1,6 @@
+# Run on CPU: 
+# python Screening.py --ngpu 0  --test --test_path ./data/sample_data/ --test_name tmp_pockets --pred_save_path  ./data/test_results/EquiScore_pred_for_tmp_pockets.csv
+# 
 import time
 import utils.utils as utils
 # from utils.utils import *
@@ -28,8 +31,9 @@ from torch.multiprocessing import Process
 def run(local_rank,args,*more_args,**kwargs):
     args.local_rank = local_rank
     #initial distribution training，'nccl'mode
-    torch.distributed.init_process_group(backend="nccl",init_method='env://',rank = args.local_rank,world_size = args.ngpu) 
-    torch.cuda.set_device(args.local_rank) 
+    if args.ngpu >= 1:
+        torch.distributed.init_process_group(backend="nccl",init_method='env://',rank = args.local_rank,world_size = args.ngpu) 
+        torch.cuda.set_device(args.local_rank) 
     seed_torch(seed = args.seed + args.local_rank)
     args_dict = vars(args)
     if args.FP:
@@ -37,7 +41,8 @@ def run(local_rank,args,*more_args,**kwargs):
     else:
         args.N_atom_features = 28
     model =EquiScore(args) if args.model == 'EquiScore' else None
-    args.device = args.local_rank
+    # Set execution device: GPU when ngpu>=1, otherwise CPU
+    args.device = torch.device(f"cuda:{args.local_rank}") if (args.ngpu >= 1 and torch.cuda.is_available()) else torch.device('cpu')
     best_name = args.save_model
     model_name = best_name.split('/')[-1]
     save_path = best_name.replace(model_name,'')
@@ -55,8 +60,9 @@ def run(local_rank,args,*more_args,**kwargs):
         test_pred = []
         for i_batch, (g,full_g,Y) in enumerate(test_dataloader):
             model.zero_grad()
-            g = g.to(args.local_rank,non_blocking=True)
-            full_g = full_g.to(args.local_rank,non_blocking=True)
+            device = args.device
+            g = g.to(device, non_blocking=True)
+            full_g = full_g.to(device, non_blocking=True)
             pred = model(g,full_g)
             if pred.dim()==2:
                 pred = torch.softmax(pred,dim = -1)[:,1]
@@ -93,10 +99,14 @@ if '__main__' == __name__:
 
     from torch.multiprocessing import Process
     world_size = args.ngpu
-    processes = []
-    for rank in range(world_size):
-        p = Process(target=run, args=(rank, args))
-        p.start()
-        processes.append(p)
-    for p in processes:
-        p.join()
+    if world_size == 0:
+        # CPU single-process fallback
+        run(0, args)
+    else:
+        processes = []
+        for rank in range(world_size):
+            p = Process(target=run, args=(rank, args))
+            p.start()
+            processes.append(p)
+        for p in processes:
+            p.join()

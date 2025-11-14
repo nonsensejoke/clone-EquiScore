@@ -41,8 +41,11 @@ def get_args_from_json(json_file_path, args_dict):
         args_dict[key] = summary_dict[key]
     return args_dict
 
-def initialize_model(model, device, args,load_save_file = False,init_classifer = True):
-    """ initialize the model parameters or load the model from a saved file"""
+def initialize_model(model, device, args, load_save_file=False, init_classifer=True):
+    """Initialize model params or load checkpoint; support CPU or GPU.
+
+    device can be a torch.device or a string like 'cpu'/'cuda:0'.
+    """
     for param in model.parameters():
         if param.dim() == 1:
             continue
@@ -74,7 +77,12 @@ def initialize_model(model, device, args,load_save_file = False,init_classifer =
         if load_save_file:
             return model ,optimizer,epoch
         return model
-    model.to(args.local_rank)
+    # Single device path: move to the provided device (CPU or single GPU)
+    try:
+        model.to(device)
+    except Exception:
+        # Fallback: coerce to torch.device if an int was passed inadvertently
+        model.to(torch.device('cuda', device) if isinstance(device, int) else torch.device('cpu'))
     if load_save_file:
         return model ,optimizer,epoch
     return model
@@ -166,19 +174,20 @@ def random_split(train_keys, split_ratio=0.9, seed=0, shuffle=True):
     train_idx, valid_idx = indices[:split], indices[split:]
     return [train_keys[i] for i in train_idx], [train_keys[i] for i in valid_idx]
 
-def evaluator(model,loader,loss_fn,args,test_sampler):
+def evaluator(model, loader, loss_fn, args, test_sampler):
     model.eval()
     with torch.no_grad():
         test_losses,test_true,test_pred = [], [],[]
         for i_batch, (g,full_g,Y) in enumerate(loader):
- 
+
             model.zero_grad()
-            g = g.to(args.local_rank,non_blocking=True)
-            full_g = full_g.to(args.local_rank,non_blocking=True)
-            Y = Y.long().to(args.local_rank,non_blocking=True)
+            device = getattr(args, 'device', 'cpu')
+            g = g.to(device, non_blocking=True)
+            full_g = full_g.to(device, non_blocking=True)
+            Y = Y.long().to(device, non_blocking=True)
             pred = model(g,full_g)
             loss = loss_fn(pred ,Y) 
- 
+
             if args.ngpu >= 1:
                 dist.all_reduce(loss.data,op = torch.distributed.ReduceOp.SUM)
                 loss /= float(dist.get_world_size()) # get all loss value 
